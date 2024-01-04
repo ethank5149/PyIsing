@@ -96,7 +96,6 @@ class IsingModel:
                         self.rng.random() < p:
                     cluster.append(spin)
                     perimeter.append(spin)
-                    # self.at[t + 1, *spin] = -self.at[t + 1, *spin]
         
         for spin in cluster:
             self.at[t + 1, *spin] = -self.at[t + 1, *spin]
@@ -123,15 +122,10 @@ class IsingModel:
         # Update id
         self.id = f"{self.ncols}x{self.nrows}_b={self.beta:0.4f}_h={self.h:0.4f}_tf={self.tf}_fps={self.fps}_method={self.method}"
 
-        file_name = f"./frames/pyising_{self.id}_frame_{str(0).zfill(4)}.png"
-        plt.imsave(file_name, self.at[0, :, :], vmin=-1, vmax=1, cmap='coolwarm')
-
         # To prevent unnecessary checks in a loop, we duplicate code
         if self.method == 'wolff':
             for _ in trange(iterations - 1, desc='Quenching System'):
                 cluster_size = self.update_wolff(_)
-                file_name = f"./frames/pyising_{self.id}_frame_{str(_ + 1).zfill(4)}.png"
-                plt.imsave(file_name, self.at[_ + 1, :, :], vmin=-1, vmax=1, cmap='coolwarm')
                 if cluster_size > 0.75:  # DEBUG
                     print("Warning: Potential Oscillatory Solution in Wolff Algorithm")
                     self.frames = _ + 1
@@ -146,11 +140,8 @@ class IsingModel:
         else:
             for _ in trange(iterations - 1, desc='Quenching System'):
                 self.update(_)
-                file_name = f"./frames/pyising_{self.id}_frame_{str(_ + 1).zfill(4)}.png"
-                plt.imsave(file_name, self.at[_ + 1, :, :], vmin=-1, vmax=1, cmap='coolwarm')
     
     def dE(self, t, i, j):
-        # return 2 * (self.J * self.metric_at(t, i, j) - self.mu * self.h) * self.at[t, i, j]
         return 0.5 * (self.J * self.metric_at(t, i, j) - self.mu * self.h) * self.at[t, i, j]
 
     def E(self, t):
