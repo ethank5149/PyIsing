@@ -1,7 +1,7 @@
 import numpy as np
-# import pandas as pd
+import pandas as pd
 from matplotlib import pyplot as plt
-from tqdm import trange, tqdm
+from tqdm import tqdm, trange
 import os, cv2
 
 
@@ -102,7 +102,7 @@ class IsingModel:
 
         return len(cluster) / self.size
 
-    def quench(self, iterations=None, beta=None, h=None, method=None):
+    def quench(self, iterations=None, beta=None, h=None, method=None, verbose=True):
         if iterations is None:
             iterations = self.frames
         if beta is None:
@@ -124,21 +124,21 @@ class IsingModel:
 
         # To prevent unnecessary checks in a loop, we duplicate code
         if self.method == 'wolff':
-            for _ in trange(iterations - 1, desc='Quenching System'):
+            for _ in trange(iterations - 1, desc='Quenching System', leave=False) if verbose else range(iterations - 1):
                 cluster_size = self.update_wolff(_)
-                if cluster_size > 0.75:  # DEBUG
-                    print("Warning: Potential Oscillatory Solution in Wolff Algorithm")
-                    self.frames = _ + 1
-                    self.tf = self.frames / self.fps
-                    self.energy = self.energy[:self.frames]
-                    self.energy_sqr = self.energy_sqr[:self.frames]
-                    self.magnetization = self.magnetization[:self.frames]
-                    self.magnetization_sqr = self.magnetization_sqr[:self.frames]
-                    self.specific_heat_capacity = self.specific_heat_capacity[:self.frames]
-                    self.magnetic_susceptibility = self.magnetic_susceptibility[:self.frames]
-                    break
+                # if cluster_size > 0.99:  # DEBUG
+                #     print("Warning: Potential Oscillatory Solution in Wolff Algorithm")
+                #     self.frames = _ + 1
+                #     self.tf = self.frames / self.fps
+                #     self.energy = self.energy[:self.frames]
+                #     self.energy_sqr = self.energy_sqr[:self.frames]
+                #     self.magnetization = self.magnetization[:self.frames]
+                #     self.magnetization_sqr = self.magnetization_sqr[:self.frames]
+                #     self.specific_heat_capacity = self.specific_heat_capacity[:self.frames]
+                #     self.magnetic_susceptibility = self.magnetic_susceptibility[:self.frames]
+                #     break
         else:
-            for _ in trange(iterations - 1, desc='Quenching System'):
+            for _ in trange(iterations - 1, desc='Quenching System', leave=False) if verbose else range(iterations - 1):
                 self.update(_)
     
     def dE(self, t, i, j):
@@ -168,8 +168,8 @@ class IsingModel:
         else:
             return self.beta * (self.M_sqr(t) - np.power(self.M(t), 2))
 
-    def gather_data(self):
-        for _ in trange(self.frames, desc='Gathering Data'):
+    def gather_data(self, verbose=True):
+        for _ in trange(self.frames, desc='Gathering Data', leave=False) if verbose else range(self.frames):
             self.energy[_] = self.E(_)
             self.energy_sqr[_] = self.E_sqr(_)
             self.magnetization[_] = self.M(_)
@@ -185,7 +185,7 @@ class IsingModel:
         t, file_name = np.linspace(0, self.tf, self.frames), f'results/pyising_{self.id}.png'
         fig, (energy_ax, magnetization_ax, diff_ax) = plt.subplots(3, 1, sharex=True, layout="constrained", figsize=(19.2, 10.8))
         fig.suptitle('PyIsing Simulation Results' + 
-                     '\n' +  # self.id 
+                     '\n' +  # self.id)
                      rf'$\beta={self.beta:0.4f},h={self.h:0.4f},t_f={self.tf:0.4f},\text{{fps}}={self.fps},${self.method} algorithm')
         fig.supxlabel(r'$t$')
 
@@ -248,13 +248,39 @@ class IsingModel:
 
         return file_name
 
+    def simulate(self, beta_range, h_range, tf=None, fps=None, method='wolff'):
+        if tf is None:
+            tf = self.tf
+        else:
+            self.tf = tf
+        if fps is None:
+            fps = self.fps
+        else:
+            self.fps = fps
+        
+        self.frames = self.tf * self.fps
 
-    # def simulate(self):
-    #     for i_h, H in enumerate(tqdm(self.Hrange, desc='Sweeping Magnetic Fields', leave=False)):
-    #         for i_t, T in enumerate(tqdm(self.Trange, desc='Sweeping Temperatures', leave=False)):
-    #             line = i_h * self.nT + i_t                
-    #             self.reset()
-    #             self.relax(H, T)
-    #             self.Hs[line], self.Ts[line], self.Es[line], self.Ms[line], self.Cs[line], self.Xs[line] = self.measure_at(H, T)
-    #     return pd.DataFrame(np.vstack((self.Hs, self.Ts, self.Es, self.Cs, self.Ms, self.Xs)).T, 
-    #                         columns=['MagneticField','Temperature', 'Energy', 'SpecificHeatCapacity', 'Magnetization', 'MagneticSusceptibility'])
+        sample_size = len(beta_range) * len(h_range)
+        h_sample, beta_sample = np.zeros(sample_size), np.zeros(sample_size)
+        energy_sample, specific_heat_capacity_sample = np.zeros(sample_size), np.zeros(sample_size)
+        magnetization_sample, magnetic_susceptibility_sample = np.zeros(sample_size), np.zeros(sample_size)
+
+        for idx_h,h in tqdm(enumerate(h_range), desc='Sweeping H', total=len(h_range), position=0, leave=False):
+            for idx_beta,beta in tqdm(enumerate(beta_range), desc='Sweeping Beta', total=len(beta_range), position=1, leave=False):
+                idx = idx_h * len(h_range) + idx_beta
+                
+                self.reset()
+                self.quench(beta=beta, h=h, method=method)  #, verbose=False)
+                self.gather_data()  # verbose=False)
+
+                beta_sample[idx] = beta
+                h_sample[idx] = h
+                energy_sample[idx] = self.energy[-1]
+                specific_heat_capacity_sample[idx] = self.specific_heat_capacity[-1]
+                magnetization_sample[idx] = self.magnetization[-1]
+                magnetic_susceptibility_sample[idx] = self.magnetic_susceptibility[-1]
+
+        return pd.DataFrame(
+            np.vstack(
+                (h_sample, beta_sample, energy_sample, specific_heat_capacity_sample, magnetization_sample, magnetic_susceptibility_sample)).T, 
+                columns=['ExternalMagneticField','ThermodynamicBeta', 'Energy', 'SpecificHeatCapacity', 'Magnetization', 'MagneticSusceptibility'])
