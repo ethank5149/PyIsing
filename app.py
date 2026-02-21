@@ -7,9 +7,11 @@ Run locally:
 Edit/develop:
     marimo edit app.py
 
-The app has two tabs:
-  1. Lattice Viewer  — watch the spin lattice evolve in real time at a chosen β and h
+The app has two sections:
+  1. Lattice Viewer  — watch the spin lattice evolve as an animation at a chosen β and h
   2. Phase Diagram   — sweep β across a range and plot E, |M|, C vs T/Tc
+
+Hardware info is available in the sidebar under Settings & Info.
 """
 
 import marimo
@@ -21,13 +23,15 @@ app = marimo.App(width="full", app_title="PyIsing")
 @app.cell
 def _imports():
     import io
+    import tempfile
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.animation as mpl_animation
     import marimo as mo
     from pyising import IsingModel, BETA_CRIT, detect_hardware, print_hardware_summary
-    return BETA_CRIT, IsingModel, detect_hardware, io, mo, np, plt, print_hardware_summary
+    return BETA_CRIT, IsingModel, detect_hardware, io, mo, mpl_animation, np, plt, print_hardware_summary, tempfile
 
 
 @app.cell
@@ -50,15 +54,35 @@ def _hardware(detect_hardware, mo, print_hardware_summary):
         mo.md(f"```\n{hw_text}\n```"),
         kind="success" if use_gpu else "warn",
     )
-    return gpu_badge, hw, use_gpu
+    return gpu_badge, hw, hw_text, use_gpu
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — Settings & Info (hardware summary moved here)
+# ---------------------------------------------------------------------------
+
+@app.cell
+def _sidebar(gpu_badge, mo):
+    mo.sidebar([
+        mo.md("## ⚙️ Settings & Info"),
+        mo.accordion({
+            "🖥️ Hardware Summary": gpu_badge,
+            "ℹ️ About": mo.md(
+                "**PyIsing** — 2D Ising Model Simulation\n\n"
+                "Interactive simulation with GPU acceleration via CuPy.\n\n"
+                "- Metropolis-Hastings (checkerboard on GPU)\n"
+                "- Wolff cluster algorithm\n"
+            ),
+        }),
+    ])
+    return
 
 
 @app.cell
-def _header(gpu_badge, mo):
+def _header(mo):
     mo.vstack([
         mo.md("# 🧲 PyIsing — 2D Ising Model"),
         mo.md("Interactive simulation with GPU acceleration via CuPy."),
-        gpu_badge,
     ])
     return
 
@@ -141,15 +165,17 @@ def _lattice_view(
     io,
     method_dropdown,
     mo,
+    mpl_animation,
     ncols_slider,
     nrows_slider,
+    np,
     plt,
     use_gpu,
 ):
     """
     This cell re-runs whenever any slider changes.
     The IsingModel is created fresh each time (small lattices are fast).
-    For large lattices, consider caching the model and only calling quench().
+    Produces an animated MP4 of the lattice evolution plus observable plots.
     """
     _nrows = nrows_slider.value
     _ncols = ncols_slider.value
@@ -166,38 +192,86 @@ def _lattice_view(
         method=method_dropdown.value,
         use_gpu=use_gpu,
     )
-    _ising.quench(verbose=False)
-    _ising.gather_data(verbose=False)
 
-    # --- Lattice image (final frame) ---
-    import numpy as _np
-    _frame = _ising.at[-1]
-    if hasattr(_frame, "get"):          # CuPy array
-        _frame = _frame.get()
-    else:
-        _frame = _np.asarray(_frame)
+    with mo.status.spinner(title="Running lattice simulation…"):
+        _ising.quench(verbose=False)
+        _ising.gather_data(verbose=False)
 
-    _fig_lat, _ax_lat = plt.subplots(figsize=(5, 5))
-    _ax_lat.imshow(_frame, cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
-    _ax_lat.set_title(
-        f"Spin lattice (final frame)\n"
+    # --- Collect all frames as numpy arrays ---
+    _all_frames = []
+    for _t in range(_ising.frames):
+        _frame = _ising.at[_t]
+        if hasattr(_frame, "get"):          # CuPy array
+            _frame = _frame.get()
+        else:
+            _frame = np.asarray(_frame)
+        _all_frames.append(_frame)
+
+    # --- Animated lattice video ---
+    _fig_anim, _ax_anim = plt.subplots(figsize=(5, 5))
+    _im = _ax_anim.imshow(
+        _all_frames[0], cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest"
+    )
+    _ax_anim.axis("off")
+    _title = _ax_anim.set_title(
+        f"Frame 0/{_ising.frames - 1}  |  "
         f"β={beta_slider.value:.3f}  h={h_slider.value:.2f}  "
         f"T/Tc={1/(beta_slider.value * 2.269):.2f}"
     )
-    _ax_lat.axis("off")
-    _buf_lat = io.BytesIO()
-    _fig_lat.savefig(_buf_lat, format="png", bbox_inches="tight", dpi=120)
-    plt.close(_fig_lat)
-    _buf_lat.seek(0)
+
+    def _update_frame(_t_idx):
+        _im.set_data(_all_frames[_t_idx])
+        _title.set_text(
+            f"Frame {_t_idx}/{_ising.frames - 1}  |  "
+            f"β={beta_slider.value:.3f}  h={h_slider.value:.2f}  "
+            f"T/Tc={1/(beta_slider.value * 2.269):.2f}"
+        )
+        return [_im, _title]
+
+    _anim = mpl_animation.FuncAnimation(
+        _fig_anim, _update_frame,
+        frames=len(_all_frames),
+        interval=1000 // _fps,
+        blit=True,
+    )
+
+    # Try MP4 first (requires ffmpeg), fall back to GIF (pillow).
+    # Animation.save() infers format from filename extension, so use a temp file.
+    import tempfile as _tempfile
+    import os as _os
+    _video_buf = io.BytesIO()
+    _video_mimetype = "video/mp4"
+    try:
+        _tmp_fd, _tmp_path = _tempfile.mkstemp(suffix=".mp4")
+        _os.close(_tmp_fd)
+        _anim.save(_tmp_path, writer="ffmpeg", fps=_fps, dpi=100)
+        with open(_tmp_path, "rb") as _f:
+            _video_buf.write(_f.read())
+        _os.unlink(_tmp_path)
+    except Exception:
+        try:
+            _os.unlink(_tmp_path)
+        except OSError:
+            pass
+        _video_buf = io.BytesIO()
+        _video_mimetype = "image/gif"
+        _tmp_fd, _tmp_path = _tempfile.mkstemp(suffix=".gif")
+        _os.close(_tmp_fd)
+        _anim.save(_tmp_path, writer="pillow", fps=_fps, dpi=100)
+        with open(_tmp_path, "rb") as _f:
+            _video_buf.write(_f.read())
+        _os.unlink(_tmp_path)
+    plt.close(_fig_anim)
+    _video_buf.seek(0)
 
     # --- Observables over time ---
     _fig_obs, (_ax1, _ax2) = plt.subplots(2, 1, figsize=(7, 5), sharex=True, layout="constrained")
-    _t = _np.arange(_ising.frames)
-    _ax1.plot(_t, _ising.energy, color="darkgreen", lw=1.5, label=r"$\langle E \rangle$")
+    _t_arr = np.arange(_ising.frames)
+    _ax1.plot(_t_arr, _ising.energy, color="darkgreen", lw=1.5, label=r"$\langle E \rangle$")
     _ax1.set_ylabel("Energy per spin")
     _ax1.legend()
     _ax1.grid(alpha=0.3)
-    _ax2.plot(_t, _ising.magnetization, color="darkorange", lw=1.5, label=r"$\langle M \rangle$")
+    _ax2.plot(_t_arr, _ising.magnetization, color="darkorange", lw=1.5, label=r"$\langle M \rangle$")
     _ax2.set_ylabel("Magnetization per spin")
     _ax2.set_xlabel("Frame")
     _ax2.legend()
@@ -208,8 +282,21 @@ def _lattice_view(
     plt.close(_fig_obs)
     _buf_obs.seek(0)
 
+    # --- Display animation + observables side by side ---
+    if _video_mimetype == "video/mp4":
+        _lattice_display = mo.video(
+            _video_buf.read(),
+            controls=True,
+            autoplay=True,
+            loop=True,
+            width=480,
+        )
+    else:
+        # GIF fallback — display as image
+        _lattice_display = mo.image(_video_buf.read(), width=480)
+
     mo.hstack([
-        mo.image(_buf_lat.read(), width=480),
+        _lattice_display,
         mo.image(_buf_obs.read(), width=600),
     ], justify="start", gap=2)
     return
@@ -327,13 +414,44 @@ def _phase_diagram(
     _a3.set_ylabel(r"Specific Heat $\langle C \rangle$")
     _a3.legend(); _a3.grid(alpha=0.3)
 
+    # --- Save plot as SVG first (vector), then PNG (raster) from same figure ---
+    _buf_svg = io.BytesIO()
+    _fig.savefig(_buf_svg, format="svg", bbox_inches="tight")
+    _buf_svg.seek(0)
+    _svg_bytes = _buf_svg.read()
+
     _buf = io.BytesIO()
     _fig.savefig(_buf, format="png", bbox_inches="tight", dpi=130)
     plt.close(_fig)
     _buf.seek(0)
+    _plot_bytes = _buf.read()
+
+    # --- Prepare CSV download ---
+    _csv_bytes = _results.to_csv(index=False).encode("utf-8")
+
+    # --- Build download buttons ---
+    _dl_png = mo.download(
+        _plot_bytes,
+        filename="pyising_phase_diagram.png",
+        mimetype="image/png",
+        label="📥 Plot (PNG)",
+    )
+    _dl_svg = mo.download(
+        _svg_bytes,
+        filename="pyising_phase_diagram.svg",
+        mimetype="image/svg+xml",
+        label="📥 Plot (SVG)",
+    )
+    _dl_csv = mo.download(
+        _csv_bytes,
+        filename="pyising_phase_diagram.csv",
+        mimetype="text/csv",
+        label="📥 Data (CSV)",
+    )
 
     mo.vstack([
-        mo.image(_buf.read()),
+        mo.image(_plot_bytes),
+        mo.hstack([_dl_png, _dl_svg, _dl_csv], justify="start", gap=1),
         mo.ui.table(_results.round(4)),
     ])
     return
