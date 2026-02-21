@@ -7,9 +7,10 @@ Run locally:
 Edit/develop:
     marimo edit app.py
 
-The app has two sections:
+The app has three sections:
   1. Lattice Viewer  — watch the spin lattice evolve as an animation at a chosen β and h
   2. Phase Diagram   — sweep β across a range and plot E, |M|, C vs T/Tc
+  3. Method Benchmark — compare all 9 Monte Carlo methods side-by-side
 
 Hardware info is available in the sidebar under Settings & Info.
 """
@@ -24,6 +25,7 @@ app = marimo.App(width="full", app_title="PyIsing")
 def _imports():
     import io
     import tempfile
+    import threading
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
@@ -31,7 +33,20 @@ def _imports():
     import matplotlib.animation as mpl_animation
     import marimo as mo
     from pyising import IsingModel, BETA_CRIT, detect_hardware, print_hardware_summary
-    return BETA_CRIT, IsingModel, detect_hardware, io, mo, mpl_animation, np, plt, print_hardware_summary, tempfile
+    from pyising.benchmark import (
+        ALL_METHODS,
+        METHOD_CATEGORIES,
+        BenchmarkConfig,
+        BenchmarkResult,
+        results_to_dataframe,
+        run_benchmark,
+    )
+    return (
+        ALL_METHODS, BETA_CRIT, BenchmarkConfig, BenchmarkResult,
+        IsingModel, METHOD_CATEGORIES, detect_hardware, io, mo,
+        mpl_animation, np, plt, print_hardware_summary,
+        results_to_dataframe, run_benchmark, tempfile, threading,
+    )
 
 
 @app.cell
@@ -70,8 +85,9 @@ def _sidebar(gpu_badge, mo):
             "ℹ️ About": mo.md(
                 "**PyIsing** — 2D Ising Model Simulation\n\n"
                 "Interactive simulation with GPU acceleration via CuPy.\n\n"
-                "- Metropolis-Hastings (checkerboard on GPU)\n"
-                "- Wolff cluster algorithm\n"
+                "**Local methods:** Metropolis-Hastings, Glauber, Overrelaxation, Kinetic MC\n\n"
+                "**Cluster methods:** Wolff, Swendsen-Wang, Invaded Cluster\n\n"
+                "**Advanced methods:** Wang-Landau, Parallel Tempering\n"
             ),
         }),
     ])
@@ -117,7 +133,10 @@ def _controls(BETA_CRIT, mo, np):
         show_value=True,
     )
     method_dropdown = mo.ui.dropdown(
-        options=["metropolis-hastings", "wolff"],
+        options=[
+            "metropolis-hastings", "glauber", "overrelaxation",
+            "wolff", "swendsen-wang", "invaded-cluster", "kinetic-mc",
+        ],
         value="metropolis-hastings",
         label="Algorithm",
     )
@@ -327,7 +346,10 @@ def _phase_controls(BETA_CRIT, mo, np):
     phase_nrows = mo.ui.slider(start=10, stop=100, step=10, value=20, label="Lattice rows", show_value=True)
     phase_ncols = mo.ui.slider(start=10, stop=100, step=10, value=20, label="Lattice cols", show_value=True)
     phase_method = mo.ui.dropdown(
-        options=["metropolis-hastings", "wolff"],
+        options=[
+            "metropolis-hastings", "glauber", "overrelaxation",
+            "wolff", "swendsen-wang", "invaded-cluster", "kinetic-mc",
+        ],
         value="metropolis-hastings",
         label="Algorithm",
     )
@@ -454,6 +476,224 @@ def _phase_diagram(
         mo.hstack([_dl_png, _dl_svg, _dl_csv], justify="start", gap=1),
         mo.ui.table(_results.round(4)),
     ])
+    return
+
+
+# ---------------------------------------------------------------------------
+# Tab 3 — Method Benchmark
+# ---------------------------------------------------------------------------
+
+@app.cell
+def _bench_header(mo):
+    mo.md("---\n## 🏁 Method Benchmark\n\n"
+           "Compare all 9 Monte Carlo methods side-by-side under identical conditions.  "
+           "Results stream in as each method completes.")
+    return
+
+
+@app.cell
+def _bench_controls(mo):
+    bench_rows = mo.ui.number(start=4, stop=100, value=20, step=1, label="Lattice rows")
+    bench_cols = mo.ui.number(start=4, stop=100, value=20, step=1, label="Lattice cols")
+    bench_tf = mo.ui.number(start=1, stop=50, value=5, step=1, label="tf (sim time)")
+    bench_fps = mo.ui.number(start=1, stop=100, value=20, step=1, label="fps")
+    bench_beta = mo.ui.slider(start=0.01, stop=2.0, step=0.01, value=0.6,
+                               label="β (inverse temperature)", show_value=True)
+    bench_seed = mo.ui.number(start=0, stop=999999, value=42, step=1, label="Seed")
+    bench_run = mo.ui.run_button(label="▶ Run Benchmark")
+    return bench_beta, bench_cols, bench_fps, bench_rows, bench_run, bench_seed, bench_tf
+
+
+@app.cell
+def _bench_controls_layout(bench_beta, bench_cols, bench_fps, bench_rows, bench_run, bench_seed, bench_tf, mo):
+    mo.hstack([
+        mo.vstack([bench_rows, bench_cols]),
+        mo.vstack([bench_tf, bench_fps]),
+        mo.vstack([bench_beta, bench_seed]),
+        mo.vstack([bench_run]),
+    ], justify="start", gap=2)
+    return
+
+
+@app.cell
+def _bench_state(mo):
+    bench_results_state, bench_set_results = mo.state([])
+    bench_status_state, bench_set_status = mo.state("")
+    return bench_results_state, bench_set_results, bench_set_status, bench_status_state
+
+
+@app.cell
+def _bench_runner(
+    BenchmarkConfig,
+    bench_beta,
+    bench_cols,
+    bench_fps,
+    bench_rows,
+    bench_run,
+    bench_seed,
+    bench_set_results,
+    bench_set_status,
+    bench_tf,
+    mo,
+    run_benchmark,
+    threading,
+    use_gpu,
+):
+    mo.stop(not bench_run.value)
+
+    bench_set_results([])
+    bench_set_status("Starting benchmark...")
+
+    _config = BenchmarkConfig(
+        nrows=bench_rows.value,
+        ncols=bench_cols.value,
+        tf=bench_tf.value,
+        fps=bench_fps.value,
+        beta=bench_beta.value,
+        seed=bench_seed.value,
+        use_gpu=use_gpu,
+    )
+
+    def _run():
+        run_benchmark(
+            config=_config,
+            on_result=lambda r: bench_set_results(lambda prev: prev + [r]),
+            on_status=lambda m, s: bench_set_status(f"Running: {m}..."),
+            on_complete=lambda _: bench_set_status("✅ Benchmark complete!"),
+        )
+
+    _thread = threading.Thread(target=_run, daemon=True)
+    _thread.start()
+    return
+
+
+@app.cell
+def _bench_status(bench_status_state, mo):
+    _status = bench_status_state() if callable(bench_status_state) else bench_status_state
+    if _status:
+        mo.callout(mo.md(f"**Status:** {_status}"), kind="info")
+    return
+
+
+@app.cell
+def _bench_table(bench_results_state, mo, results_to_dataframe):
+    _results = bench_results_state() if callable(bench_results_state) else bench_results_state
+    if not _results:
+        mo.stop(True, mo.callout(
+            mo.md("⏳ Configure parameters above and click **▶ Run Benchmark** to start."),
+            kind="info",
+        ))
+
+    mo.vstack([
+        mo.md("### 📊 Results Table"),
+        mo.ui.table(results_to_dataframe(_results)),
+    ])
+    return
+
+
+@app.cell
+def _bench_charts(METHOD_CATEGORIES, bench_results_state, mo, np, plt):
+    _results = bench_results_state() if callable(bench_results_state) else bench_results_state
+    if not _results:
+        mo.stop(True)
+
+    _cat_colors = {"local": "#3b82f6", "cluster": "#f97316", "advanced": "#22c55e"}
+
+    _observables = [
+        ("Energy ⟨E⟩", "energy"),
+        ("|Magnetization| |⟨M⟩|", "abs_magnetization"),
+        ("Specific Heat C", "specific_heat"),
+        ("Susceptibility χ", "susceptibility"),
+        ("Wall Time (s)", "wall_time"),
+    ]
+
+    _methods = [r.method for r in _results]
+    _colors = [_cat_colors.get(METHOD_CATEGORIES.get(m, "local"), "#888") for m in _methods]
+    _y_pos = np.arange(len(_methods))
+
+    _figs = []
+    for _title, _attr in _observables:
+        _values = [getattr(r, _attr) for r in _results]
+        _fig, _ax = plt.subplots(figsize=(10, max(3, 0.6 * len(_methods))))
+        _ax.barh(_y_pos, _values, color=_colors, edgecolor="white", linewidth=0.5)
+        _ax.set_yticks(_y_pos)
+        _ax.set_yticklabels(_methods, fontsize=9)
+        _ax.set_xlabel(_title)
+        _ax.set_title(_title)
+        _ax.invert_yaxis()
+        _ax.grid(axis="x", alpha=0.3)
+        _fig.tight_layout()
+        _figs.append(_fig)
+
+    _legend = mo.md(
+        f'<span style="color:{_cat_colors["local"]}">■</span> Local &nbsp; '
+        f'<span style="color:{_cat_colors["cluster"]}">■</span> Cluster &nbsp; '
+        f'<span style="color:{_cat_colors["advanced"]}">■</span> Advanced'
+    )
+
+    mo.vstack([
+        mo.md("### 📈 Comparison Charts"),
+        mo.hstack([_legend], justify="center"),
+        mo.hstack([mo.as_html(_figs[0]), mo.as_html(_figs[1])], gap=1),
+        mo.hstack([mo.as_html(_figs[2]), mo.as_html(_figs[3])], gap=1),
+        mo.as_html(_figs[4]),
+    ])
+
+    for _f in _figs:
+        plt.close(_f)
+    return
+
+
+@app.cell
+def _bench_snapshots(bench_results_state, mo, np, plt):
+    _results = bench_results_state() if callable(bench_results_state) else bench_results_state
+    if not _results:
+        mo.stop(True)
+
+    _snapshots = [
+        (r.method, r.final_lattice)
+        for r in _results
+        if r.final_lattice is not None and np.any(r.final_lattice != 0)
+    ]
+
+    if not _snapshots:
+        mo.stop(True, mo.callout(
+            mo.md("No lattice snapshots available yet."),
+            kind="info",
+        ))
+
+    _n = len(_snapshots)
+    _ncols_grid = min(_n, 4)
+    _nrows_grid = (_n + _ncols_grid - 1) // _ncols_grid
+
+    _fig, _axes = plt.subplots(
+        _nrows_grid, _ncols_grid,
+        figsize=(4 * _ncols_grid, 4 * _nrows_grid),
+        squeeze=False,
+    )
+
+    for _i, (_method, _lattice) in enumerate(_snapshots):
+        _r = _i // _ncols_grid
+        _c = _i % _ncols_grid
+        _ax = _axes[_r][_c]
+        _ax.imshow(_lattice, cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
+        _ax.set_title(_method, fontsize=10)
+        _ax.axis("off")
+
+    for _i in range(len(_snapshots), _nrows_grid * _ncols_grid):
+        _r = _i // _ncols_grid
+        _c = _i % _ncols_grid
+        _axes[_r][_c].axis("off")
+
+    _fig.suptitle("Final Lattice Snapshots", fontsize=14)
+    _fig.tight_layout()
+
+    mo.vstack([
+        mo.md("### 🔬 Final Lattice Snapshots"),
+        mo.md("*Wang-Landau and Parallel Tempering do not produce lattice snapshots.*"),
+        mo.as_html(_fig),
+    ])
+    plt.close(_fig)
     return
 
 
