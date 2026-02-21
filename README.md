@@ -122,6 +122,149 @@ Example output:
 ────────────────────────────────────────────────────────
 ```
 
+## Available Methods
+
+PyIsing implements a comprehensive suite of Monte Carlo algorithms for simulating the Ising model. Each method has distinct computational characteristics, GPU support, and optimal use cases.
+
+### Methods Reference
+
+| Method | String ID | Type | GPU Support |
+|--------|-----------|------|-------------|
+| Metropolis-Hastings | `'metropolis-hastings'` | Single-spin flip | Checkerboard ✓ |
+| Wolff | `'wolff'` | Cluster | No |
+| Glauber (Heat Bath) | `'glauber'` | Single-spin flip | Checkerboard ✓ |
+| Overrelaxation | `'overrelaxation'` | Single-spin flip | Checkerboard ✓ |
+| Swendsen-Wang | `'swendsen-wang'` | Cluster | No |
+| Invaded Cluster | `'invaded-cluster'` | Cluster | No |
+| Kinetic Monte Carlo | `'kinetic-mc'` | Event-driven | No |
+| Wang-Landau | `'wang-landau'` | Advanced (flat histogram) | No |
+| Parallel Tempering | `'parallel-tempering'` | Advanced (replica exchange) | Partial (batch updates) |
+
+### Using Frame-by-Frame Methods
+
+Frame-by-frame methods are used via [`quench()`](./src/pyising/model.py) or [`simulate()`](./src/pyising/model.py) to evolve the spin lattice step-by-step.
+
+#### Metropolis-Hastings (Sequential & Checkerboard)
+
+Classic single-spin-flip algorithm. On GPU, uses checkerboard sublattice parallelization for fully parallel updates. Ideal for equilibration and general-purpose phase diagram studies.
+
+```python
+# CPU single-spin flip or GPU checkerboard variant
+ising = IsingModel(nrows=50, ncols=50, method='metropolis-hastings', use_gpu=True)
+ising.quench(beta=0.6, n_steps=1000)
+```
+
+#### Wolff (Cluster Algorithm)
+
+Single-cluster flipping with automatic cluster size tuning. Fast critical slowing-down reduction near phase transitions. CPU-only.
+
+```python
+ising = IsingModel(nrows=50, ncols=50, method='wolff', use_gpu=False)
+results = ising.simulate(beta_range=np.linspace(0.4, 1.0, 50), sample_size=20)
+```
+
+#### Glauber (Heat Bath)
+
+Heat bath dynamics with local field probability $P(+1) = 1/(1+\exp(-\beta h_{\text{local}}))$. Smooth acceptance probabilities reduce correlations. GPU checkerboard variant available.
+
+```python
+ising = IsingModel(nrows=100, ncols=100, method='glauber', use_gpu=True)
+ising.quench(beta=1.2, n_steps=500)
+```
+
+#### Overrelaxation
+
+Microcanonical energy-preserving algorithm that flips only sites where the local field is zero. Useful for studying dynamics without thermal noise. GPU checkerboard variant available.
+
+```python
+ising = IsingModel(nrows=50, ncols=50, method='overrelaxation')
+results = ising.simulate(beta_range=[0.8], h_range=[0.0], sample_size=10)
+```
+
+#### Swendsen-Wang (Cluster Algorithm)
+
+Identifies all clusters simultaneously via union-find and flips each with probability 1/2. Excellent critical scaling behavior. CPU-only.
+
+```python
+ising = IsingModel(nrows=64, ncols=64, method='swendsen-wang')
+ising.quench(beta=0.6, n_steps=100)  # Fast convergence near Tc
+```
+
+#### Invaded Cluster (Self-Tuning)
+
+Self-tuning cluster algorithm that grows clusters by sorted bond weights until percolation. Adapts cluster size automatically. CPU-only.
+
+```python
+ising = IsingModel(nrows=50, ncols=50, method='invaded-cluster')
+results = ising.simulate(beta_range=[0.44, 0.50], sample_size=15)
+```
+
+#### Kinetic Monte Carlo (Event-Driven)
+
+Event-driven continuous-time algorithm with Glauber rates. Selects sites proportional to flip rate rather than uniformly. Provides true continuous-time dynamics. CPU-only.
+
+```python
+ising = IsingModel(nrows=50, ncols=50, method='kinetic-mc')
+ising.quench(beta=0.8, n_steps=200)
+```
+
+### Standalone Advanced Methods
+
+Advanced methods are invoked directly via dedicated methods and return specialized results.
+
+#### Wang-Landau Density of States
+
+Flat histogram method that estimates the density of states $g(E)$ across the entire energy range. Useful for any-temperature observables without re-running simulations.
+
+```python
+ising = IsingModel(nrows=32, ncols=32)
+
+# Perform Wang-Landau sampling
+wl_result = ising.simulate_wang_landau(
+    flatness=0.8,      # Flatness criterion (0.0-1.0)
+    f_min=1e-8,        # Final histogram scaling factor
+    n_sweeps=50        # Sweeps per iteration
+)
+
+# Compute observables at arbitrary temperatures
+beta_range = np.linspace(0.1, 2.0, 100)
+observables_df = ising.wang_landau_observables(wl_result, beta_range=beta_range)
+print(observables_df)
+```
+
+The returned DataFrame contains columns: `beta`, `energy`, `magnetization`, `heat_capacity`, `susceptibility`.
+
+#### Parallel Tempering (Replica Exchange)
+
+Multiple replicas at different temperatures exchange configurations via Metropolis criterion. Overcomes free energy barriers and explores phase space efficiently.
+
+```python
+ising = IsingModel(nrows=50, ncols=50)
+
+# Run parallel tempering across temperature range
+results_df = ising.simulate_parallel_tempering(
+    beta_range=np.linspace(0.2, 1.0, 20),  # Replicas at these β values
+    h=0.0,                                   # External field
+    n_sweeps=200,                            # Sweeps per swap interval
+    swap_interval=10                         # Swap every N sweeps
+)
+
+print(results_df)
+```
+
+The returned DataFrame contains ensemble-averaged observables: `beta`, `energy`, `magnetization`, `heat_capacity`, `susceptibility`.
+
+### Choosing a Method
+
+| Goal | Recommended Methods |
+|------|---------------------|
+| Fast phase diagram mapping | Metropolis-Hastings (GPU) or Glauber (GPU) |
+| Near critical temperature | Wolff, Swendsen-Wang, or Invaded Cluster |
+| Density of states / any-T observables | Wang-Landau |
+| Free energy barriers | Parallel Tempering |
+| Dynamics with no thermal noise | Overrelaxation |
+| True continuous-time dynamics | Kinetic Monte Carlo |
+
 ## Package Structure
 
 ```
